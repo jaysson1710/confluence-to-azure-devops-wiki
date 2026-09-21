@@ -9,7 +9,8 @@ import os
 import re
 import json
 import base64
-from urllib.parse import urlparse, urljoin
+import html
+from urllib.parse import parse_qs, urlparse, urljoin, unquote
 from pathlib import Path
 import html2text
 from typing import Dict, List, Tuple, Optional
@@ -36,10 +37,51 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         self.created_folders = set()
         self.wiki_structure = {}
         self.committed_images = set()  # Track committed images to avoid duplicates
+        self.work_item_mapping = self.load_work_item_mapping('itemsJournal.txt')
+        self.user_mapping = self.load_key_value_mapping('users.txt')
+        self.emoji_mapping = self.load_emoji_mapping('shortcode-emojis.json')
         
         # Create directories for local storage
         os.makedirs('temp_images', exist_ok=True)
         os.makedirs('processed_pages', exist_ok=True)
+
+    def load_work_item_mapping(self, filename: str) -> Dict[str, str]:
+        """Load Jira issue keys and their Azure DevOps work item IDs."""
+        mappings = {}
+        mapping_path = Path(filename)
+        if not mapping_path.exists():
+            return mappings
+
+        for line in mapping_path.read_text(encoding='utf-8').splitlines():
+            parts = line.strip().split(';')
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                mappings.setdefault(parts[0].upper(), parts[1])
+        return mappings
+
+    def load_key_value_mapping(self, filename: str) -> Dict[str, str]:
+        """Load Confluence user identifiers and their Azure DevOps equivalents."""
+        mappings = {}
+        mapping_path = Path(filename)
+        if not mapping_path.exists():
+            return mappings
+
+        for line in mapping_path.read_text(encoding='utf-8').splitlines():
+            source, separator, destination = line.strip().partition('=')
+            if separator and source and destination:
+                mappings[source] = destination
+        return mappings
+
+    def load_emoji_mapping(self, filename: str) -> Dict[str, str]:
+        """Load Confluence emoji shortcode replacements."""
+        mapping_path = Path(filename)
+        if not mapping_path.exists():
+            return {}
+
+        try:
+            return json.loads(mapping_path.read_text(encoding='utf-8'))
+        except json.JSONDecodeError as error:
+            print(f"  ⚠️ Unable to read emoji mapping: {error}")
+            return {}
 
     def get_safe_filename_corrected(self, title: str) -> str:
         """Generate Azure DevOps Wiki compliant filename - SPACES TO HYPHENS!"""
@@ -54,12 +96,24 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         
         # Remove leading and trailing hyphens
         safe_title = safe_title.strip('-')
-        
+
         # Ensure it's not empty
         if not safe_title:
             safe_title = "untitled"
-            
+
         return safe_title
+
+    def get_attachment_azure_path(self, attachment: Dict, page_id: str) -> str:
+        """Generate a unique Azure DevOps Wiki path for a Confluence attachment."""
+        filename = attachment['title']
+        if '.' in filename:
+            name_part, ext_part = filename.rsplit('.', 1)
+            safe_filename = f"{self.get_safe_filename_corrected(name_part)}.{ext_part}"
+        else:
+            safe_filename = self.get_safe_filename_corrected(filename)
+
+        attachment_id = self.get_safe_filename_corrected(str(attachment.get('id', filename)))
+        return f"/.attachments/{page_id}-{attachment_id}-{safe_filename}"
 
 
     def get_confluence_pages(self, space_key: str) -> List[Dict]:
@@ -115,7 +169,7 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         path_parts = []
         
         # Build proper folder hierarchy - Skip EVP root ancestor
-        non_evp_ancestors = [a for a in ancestors if a.get('title') != 'EVP']
+        non_evp_ancestors = [ancestor for ancestor in ancestors if ancestor.get('title') != 'EVP']
         
         # Each ancestor becomes a folder in the path
         for ancestor in non_evp_ancestors:
@@ -179,7 +233,7 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                 
                 for part in path_parts:
                     if current_path:
-                        current_path += f"/{part}"
+                        current_path = f"{current_path}/{part}"
                     else:
                         current_path = part
                     
@@ -198,7 +252,6 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                     folder_pages.append(wiki_files[wiki_path])
             
             if folder_pages:
-                # Sort pages by some logical order (you can customize this)
                 folder_pages.sort(key=lambda x: x['title'])
                 
                 # Create .order file content
@@ -242,10 +295,11 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                 safe_filename = self.get_safe_filename_corrected(name_part) + '.' + ext_part
             else:
                 safe_filename = self.get_safe_filename_corrected(filename)
-            local_path = f"temp_images/{page_id}_{safe_filename}"
+            attachment_id = self.get_safe_filename_corrected(str(attachment.get('id', filename)))
+            local_path = f"temp_images/{page_id}_{attachment_id}_{safe_filename}"
             
             if local_path in self.downloaded_images:
-                return self.downloaded_images[local_path]
+                return local_path
             
             # Try downloading
             for attempt in range(2):
@@ -256,18 +310,7 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                     with open(local_path, 'wb') as f:
                         f.write(response.content)
                     
-                    # Calculate and store the correct Azure path immediately
-                    filename = os.path.basename(local_path).split('_', 1)[1]  # Remove page_id prefix
-                    
-                    # Apply same filename transformation as used in markdown
-                    if '.' in filename:
-                        name_part = filename.rsplit('.', 1)[0]
-                        ext_part = filename.rsplit('.', 1)[1]
-                        safe_filename = self.get_safe_filename_corrected(name_part) + '.' + ext_part
-                    else:
-                        safe_filename = self.get_safe_filename_corrected(filename)
-                    
-                    azure_path = f"/.attachments/{safe_filename}"
+                    azure_path = self.get_attachment_azure_path(attachment, page_id)
                     self.downloaded_images[local_path] = azure_path
                     print(f"  ✅ Downloaded image: {filename}")
                     return local_path
@@ -296,17 +339,9 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                         local_path = self.download_image_safe(attachment, page_id)
                         
                         if local_path:
-                            # Replace references in HTML - Fixed variable scope
-                            if '.' in filename:
-                                name_part = filename.rsplit('.', 1)[0]
-                                ext_part = filename.rsplit('.', 1)[1]
-                                safe_filename = self.get_safe_filename_corrected(name_part) + '.' + ext_part
-                            else:
-                                safe_filename = self.get_safe_filename_corrected(filename)
-                            
                             # Replace Confluence image references with Azure DevOps Wiki markdown syntax
                             # Azure DevOps Wiki requires: ![alt](.attachments/file.ext) format
-                            attachment_path = f".attachments/{safe_filename}"
+                            attachment_path = self.downloaded_images[local_path].lstrip('/')
                             
                             # CORRECTED Confluence image reference patterns - FIXED to avoid content truncation
                             patterns_to_replace = [
@@ -325,7 +360,7 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                             for pattern in patterns_to_replace:
                                 html_content = re.sub(
                                     pattern, 
-                                    f'![{safe_filename}]({attachment_path})',
+                                    f'![{filename}]({attachment_path})',
                                     html_content,
                                     flags=re.IGNORECASE | re.DOTALL
                                 )
@@ -378,6 +413,10 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         try:
             # First process images
             html_content = self.process_confluence_images(html_content, page_id)
+            html_content = self.decode_unicode_escapes(html_content)
+            html_content = self.replace_confluence_references(html_content)
+            html_content, video_blocks = self.replace_embedded_videos(html_content)
+            html_content = self.replace_confluence_macros(html_content)
             
             h = html2text.HTML2Text()
             h.ignore_links = False
@@ -387,6 +426,8 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
             h.unicode_snob = True
             
             markdown_content = h.handle(html_content)
+            for placeholder, video_block in video_blocks.items():
+                markdown_content = markdown_content.replace(placeholder, video_block)
             markdown_content = re.sub(r'\n{3,}', '\n\n', markdown_content)
             
             return markdown_content.strip()
@@ -394,6 +435,168 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         except Exception as e:
             print(f"  ⚠️ HTML conversion error: {str(e)}")
             return f"# Content conversion failed\n\nError: {str(e)}"
+
+    def decode_unicode_escapes(self, content: str) -> str:
+        """Decode literal JSON Unicode escapes while preserving malformed input unchanged."""
+        escaped_unicode_pattern = re.compile(r'(?:\\u[0-9a-fA-F]{4})+')
+
+        def decode_match(match: re.Match) -> str:
+            try:
+                decoded = json.loads(f'"{match.group(0)}"')
+                decoded.encode('utf-8')
+                return decoded
+            except (UnicodeEncodeError, json.JSONDecodeError):
+                return match.group(0)
+
+        return escaped_unicode_pattern.sub(decode_match, content)
+
+    def replace_confluence_references(self, html_content: str) -> str:
+        """Resolve Confluence emojis, users, and Jira links for Azure DevOps Wiki."""
+        def replace_emoticon(match: re.Match) -> str:
+            attributes = match.group('attributes')
+            shortcode_match = re.search(r'ac:emoji-shortname=["\'](?P<value>[^"\']+)["\']', attributes)
+            fallback_match = re.search(r'ac:emoji-fallback=["\'](?P<value>[^"\']+)["\']', attributes)
+            shortcode = shortcode_match.group('value') if shortcode_match else None
+            fallback = fallback_match.group('value') if fallback_match else ''
+            return self.emoji_mapping.get(shortcode, fallback)
+
+        def replace_user(match: re.Match) -> str:
+            attributes = match.group('attributes')
+            account_match = re.search(r'ri:account-id=["\'](?P<value>[^"\']+)["\']', attributes)
+            username_match = re.search(r'ri:username=["\'](?P<value>[^"\']+)["\']', attributes)
+            user_id = account_match.group('value') if account_match else (
+                username_match.group('value') if username_match else None
+            )
+            return html.escape(self.user_mapping.get(user_id, user_id or 'Unknown user'))
+
+        def replace_jira_link(match: re.Match) -> str:
+            href = html.unescape(match.group('href'))
+            issue_keys = set(re.findall(r'\b[A-Z][A-Z0-9]+-\d+\b', unquote(href).upper()))
+            if len(issue_keys) != 1:
+                return match.group(0)
+
+            issue_key = issue_keys.pop()
+            work_item_id = self.work_item_mapping.get(issue_key)
+            if not work_item_id:
+                return match.group(0)
+
+            organization = self.azuredevops_config['organization']
+            project = self.azuredevops_config['project']
+            ado_href = f"https://dev.azure.com/{organization}/{project}/_workitems/edit/{work_item_id}"
+            return match.group(0).replace(match.group('href'), ado_href)
+
+        html_content = re.sub(
+            r'<ac:emoticon\b(?P<attributes>[^>]*)/\s*>', replace_emoticon, html_content, flags=re.IGNORECASE
+        )
+        html_content = re.sub(
+            r'<ri:user\b(?P<attributes>[^>]*)/\s*>', replace_user, html_content, flags=re.IGNORECASE
+        )
+        return re.sub(
+            r'<a\b[^>]*\bhref=["\'](?P<href>[^"\']+)["\'][^>]*>', replace_jira_link, html_content,
+            flags=re.IGNORECASE
+        )
+
+    def replace_embedded_videos(self, html_content: str) -> Tuple[str, Dict[str, str]]:
+        """Convert supported Confluence video cards to Azure DevOps Wiki video directives."""
+        video_blocks = {}
+        anchor_pattern = re.compile(
+            r'<a\b(?P<attributes>[^>]*)>.*?</a>',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        def replace_video(match: re.Match) -> str:
+            attributes = match.group('attributes')
+            if not re.search(r'data-card-appearance=["\']embed["\']', attributes, re.IGNORECASE):
+                return match.group(0)
+
+            href_match = re.search(r'\bhref=["\'](?P<href>[^"\']+)["\']', attributes, re.IGNORECASE)
+            if not href_match:
+                return match.group(0)
+
+            source_url = html.unescape(href_match.group('href'))
+            parsed_url = urlparse(source_url)
+            host = parsed_url.netloc.lower()
+            video_id = None
+            embed_url = None
+
+            if host in {'youtube.com', 'www.youtube.com', 'm.youtube.com'}:
+                if parsed_url.path == '/watch':
+                    video_id = parse_qs(parsed_url.query).get('v', [None])[0]
+                elif parsed_url.path.startswith('/embed/'):
+                    video_id = parsed_url.path.split('/', 2)[2]
+                if video_id and re.fullmatch(r'[A-Za-z0-9_-]{6,}', video_id):
+                    embed_url = f"https://www.youtube.com/embed/{video_id}"
+            elif host == 'youtu.be':
+                video_id = parsed_url.path.strip('/').split('/')[0]
+                if video_id and re.fullmatch(r'[A-Za-z0-9_-]{6,}', video_id):
+                    embed_url = f"https://www.youtube.com/embed/{video_id}"
+            elif host.endswith('microsoftstream.com') or host.endswith('stream.microsoft.com'):
+                embed_url = source_url.replace('/video/', '/embed/video/', 1)
+            elif host.endswith('.sharepoint.com'):
+                embed_url = source_url
+
+            if not embed_url:
+                return match.group(0)
+
+            placeholder = f"CONFLUENCE_VIDEO_PLACEHOLDER_{len(video_blocks)}"
+            video_blocks[placeholder] = (
+                '::: video\n'
+                f'<iframe width="640" height="360" src="{embed_url}" allowfullscreen style="border:none"></iframe>\n'
+                ':::'
+            )
+            return placeholder
+
+        return anchor_pattern.sub(replace_video, html_content), video_blocks
+
+    def replace_confluence_macros(self, html_content: str) -> str:
+        """Replace unsupported Confluence dynamic macros with readable static notes."""
+        supported_macros = {
+            "content-report-table": "Dynamic Confluence content report",
+            "decisionreport": "Dynamic Confluence decision report",
+            "tasks-report-macro": "Dynamic Confluence task report",
+            "create-from-template": "Confluence create-from-template action"
+        }
+        visible_parameters = {
+            "space", "spaces", "label", "labels", "status", "assignee", "cql", "query", "sort"
+        }
+
+        macro_pattern = re.compile(
+            r'<ac:(?:structured-)?macro\b(?=[^>]*\bac:name="(?P<name>[^"]+)")[^>]*>.*?</ac:(?:structured-)?macro>',
+            re.IGNORECASE | re.DOTALL
+        )
+        parameter_pattern = re.compile(
+            r'<ac:parameter\b[^>]*\bac:name="(?P<name>[^"]+)"[^>]*>(?P<value>.*?)</ac:parameter>',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        def replace_macro(match: re.Match) -> str:
+            macro_name = match.group('name').lower()
+            description = supported_macros.get(macro_name)
+            if not description:
+                return ""
+
+            parameters = []
+            for parameter in parameter_pattern.finditer(match.group(0)):
+                parameter_name = parameter.group('name').lower()
+                if parameter_name not in visible_parameters:
+                    continue
+
+                value = re.sub(r'<[^>]+>', '', parameter.group('value'))
+                value = html.unescape(value).strip()
+                if value:
+                    parameters.append(
+                        f"<li><strong>{html.escape(parameter_name)}:</strong> {html.escape(value)}</li>"
+                    )
+
+            filters = ''.join(parameters) if parameters else '<li>No portable filters were found.</li>'
+            return (
+                '<table><thead><tr><th>Confluence report</th><th>Migration status</th></tr></thead>'
+                f'<tbody><tr><td>{html.escape(description)}</td>'
+                '<td>Report rows are dynamic in Confluence and are not stored in the page body. '
+                f'<ul>{filters}</ul></td></tr></tbody></table>'
+            )
+
+        return macro_pattern.sub(replace_macro, html_content)
 
     def commit_corrected_wiki_structure(self, wiki_files: Dict) -> bool:
         """Commit the corrected structure to Azure DevOps Wiki using Git API"""
@@ -751,9 +954,11 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                 changes = []
                 for file_item in batch:
                     if file_item['type'] == 'page':
+                        page_path = f"/{file_item['path']}"
+                        change_type = "edit" if self.check_file_exists_in_azure(page_path) else "add"
                         changes.append({
-                            "changeType": "add",
-                            "item": {"path": f"/{file_item['path']}"},
+                            "changeType": change_type,
+                            "item": {"path": page_path},
                             "newContent": {
                                 "content": file_item['content'],
                                 "contentType": "rawtext"
@@ -763,9 +968,12 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
                         import base64
                         with open(file_item['local_path'], 'rb') as f:
                             image_content = base64.b64encode(f.read()).decode()
+
+                        image_path = file_item['path']
+                        change_type = "edit" if self.check_file_exists_in_azure(image_path) else "add"
                         changes.append({
-                            "changeType": "add",
-                            "item": {"path": f"/{file_item['path']}"},
+                            "changeType": change_type,
+                            "item": {"path": image_path},
                             "newContent": {
                                 "content": image_content,
                                 "contentType": "base64encoded"
