@@ -17,7 +17,8 @@ from typing import Dict, List, Tuple, Optional
 import time
 
 class ConfluenceToAzureDevOpsHierarchicalMigrator:
-    def __init__(self, confluence_config: Dict, azuredevops_config: Dict):
+    def __init__(self, confluence_config: Dict, azuredevops_config: Dict,
+                 users_file: str = 'users.txt', items_journal_file: str = 'itemsJournal.txt'):
         """Initialize migrator with configuration for both systems"""
         self.confluence_config = confluence_config
         self.azuredevops_config = azuredevops_config
@@ -37,8 +38,8 @@ class ConfluenceToAzureDevOpsHierarchicalMigrator:
         self.created_folders = set()
         self.wiki_structure = {}
         self.committed_images = set()  # Track committed images to avoid duplicates
-        self.work_item_mapping = self.load_work_item_mapping('itemsJournal.txt')
-        self.user_mapping = self.load_key_value_mapping('users.txt')
+        self.work_item_mapping = self.load_work_item_mapping(items_journal_file)
+        self.user_mapping = self.load_key_value_mapping(users_file)
         self.emoji_mapping = self.load_emoji_mapping('shortcode-emojis.json')
         
         # Create directories for local storage
